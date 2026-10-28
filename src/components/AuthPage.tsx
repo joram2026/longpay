@@ -1,0 +1,1180 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { motion } from 'motion/react';
+import { auth, db } from '../firebase';
+import { useToast } from '../context/ToastContext';
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  sendPasswordResetEmail,
+  signOut,
+  updatePassword
+} from 'firebase/auth';
+import { doc, setDoc, serverTimestamp, getDoc, collection, query, where, getDocs, updateDoc, increment, addDoc, deleteDoc } from 'firebase/firestore';
+import { Shield, Mail, Lock, User, Phone, Sparkles, AlertCircle, RefreshCw, Eye, EyeOff, Globe, ChevronDown, Check, TrendingUp, Zap, Award, ArrowUpRight, Activity, DollarSign, Users, Percent, CheckCircle, ArrowLeft, KeyRound, CheckCheck, Headphones, Handshake } from 'lucide-react';
+import { validateEmailAddress } from '../utils/emailValidation';
+import { SUPPORTED_COUNTRIES } from '../utils/timezones';
+
+interface AuthPageProps {
+  onSuccess: () => void;
+  path: string;
+  navigate: (path: string, clearSearch?: boolean) => void;
+}
+
+function deriveAuthPassword(email: string): string {
+  const cleanEmail = email.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+  return `LoloAuth_${cleanEmail}_Secure123!`;
+}
+
+export default function AuthPage({ onSuccess, path, navigate }: AuthPageProps) {
+  // Derive view states directly from the URL path prop to prevent desynchronization
+  const isSignUp = path === '/signup';
+  const isReset = path === '/reset';
+
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [phone, setPhone] = useState('');
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [resetConfirmPassword, setResetConfirmPassword] = useState('');
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [displayName, setDisplayName] = useState('');
+  const [country, setCountry] = useState('Kenya');
+  const [isCountryOpen, setIsCountryOpen] = useState(false);
+
+  const [emailSuggestion, setEmailSuggestion] = useState<string | null>(null);
+
+  const COUNTRIES = SUPPORTED_COUNTRIES;
+  const [referral, setReferral] = useState(() => localStorage.getItem('pending_referral_code') || '');
+  const referralNotifiedRef = useRef(false);
+  const toast = useToast();
+  const [isDraggingSupport, setIsDraggingSupport] = useState(false);
+  const dragStartTimeRef = useRef<number>(0);
+  const [loading, setLoading] = useState(false);
+  const [errorState, setErrorState] = useState<string | null>(null);
+  const setError = (msg: string | null) => {
+    setErrorState(msg);
+    if (msg) toast.error(msg, 'Authentication Error');
+  };
+  const error = errorState;
+
+  const [successMsgState, setSuccessMsgState] = useState<string | null>(null);
+  const setSuccessMsg = (msg: string | null) => {
+    setSuccessMsgState(msg);
+    if (msg) toast.success(msg, 'Authentication');
+  };
+  const successMsg = successMsgState;
+
+  // Two-Factor Authentication Login States
+  const [show2faPrompt, setShow2faPrompt] = useState(false);
+  const [twoFactorCode, setTwoFactorCode] = useState('');
+  const [twoFactorErrorState, setTwoFactorErrorState] = useState<string | null>(null);
+  const setTwoFactorError = (msg: string | null) => {
+    setTwoFactorErrorState(msg);
+    if (msg) toast.error(msg, '2FA Code Error');
+  };
+  const twoFactorError = twoFactorErrorState;
+
+  const [showPassword, setShowPassword] = useState(false);
+
+  // Check email for domain suggestions / typos on change
+  useEffect(() => {
+    if (email && email.includes('@')) {
+      const validation = validateEmailAddress(email);
+      if (validation.suggestion) {
+        setEmailSuggestion(validation.suggestion);
+      } else {
+        setEmailSuggestion(null);
+      }
+    } else {
+      setEmailSuggestion(null);
+    }
+  }, [email]);
+
+  // Check URL parameters and localStorage for referral codes
+  useEffect(() => {
+    const searchParams = new URLSearchParams(window.location.search);
+    let refCode = searchParams.get('ref') || searchParams.get('code');
+    if (!refCode) {
+      const hashIndex = window.location.hash.indexOf('?');
+      if (hashIndex !== -1) {
+        const hashParams = new URLSearchParams(window.location.hash.substring(hashIndex));
+        refCode = hashParams.get('ref') || hashParams.get('code');
+      }
+    }
+    
+    if (refCode) {
+      const upperRefCode = refCode.trim().toUpperCase();
+      localStorage.setItem('pending_referral_code', upperRefCode);
+      setReferral(upperRefCode);
+      if (path !== '/signup') {
+        navigate('/signup', true); // Navigate and clear search params!
+      }
+      if (!referralNotifiedRef.current) {
+        referralNotifiedRef.current = true;
+        setSuccessMsg(`Welcome! Referral code "${upperRefCode}" has been successfully pre-filled.`);
+      }
+    } else {
+      const savedRef = localStorage.getItem('pending_referral_code') || '';
+      if (savedRef) {
+        setReferral((prev) => (prev ? prev : savedRef));
+        // Only show prefilled message if they are explicitly on /signup
+        if (path === '/signup' && !referralNotifiedRef.current) {
+          referralNotifiedRef.current = true;
+          setSuccessMsg(`Welcome! Referral code "${savedRef}" has been successfully pre-filled.`);
+        }
+      }
+    }
+  }, [path, navigate]);
+
+  const handleVerify2faLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    setTwoFactorError(null);
+    if (twoFactorCode.trim().length !== 6 || isNaN(Number(twoFactorCode.trim()))) {
+      setTwoFactorError('Please enter a valid 6-digit Google Authenticator code.');
+      return;
+    }
+    // Validation successful! Proceed to the main dashboard
+    localStorage.removeItem('pending_referral_code');
+    onSuccess();
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    setSuccessMsg(null);
+
+    const formattedEmail = email.trim().toLowerCase();
+
+    try {
+      if (isReset) {
+        // Handle custom Password Reset directly in the database
+        if (!resetNewPassword || !resetConfirmPassword) {
+          throw new Error('Please fill in both password fields.');
+        }
+        if (resetNewPassword.length < 6) {
+          throw new Error('Password must be at least 6 characters.');
+        }
+        if (resetNewPassword !== resetConfirmPassword) {
+          throw new Error('Passwords do not match.');
+        }
+
+        const usersRef = collection(db, 'users');
+        const q = query(usersRef, where('email', '==', formattedEmail));
+        const querySnap = await getDocs(q);
+
+        if (querySnap.empty) {
+          throw new Error('No registered account found with this email.');
+        }
+
+        const userDoc = querySnap.docs[0];
+        const userUid = userDoc.id;
+
+        // Update custom password in Firestore
+        await updateDoc(doc(db, 'users', userUid), {
+          accountPassword: resetNewPassword
+        });
+
+        setSuccessMsg('Your password has been successfully updated. Redirecting to login page...');
+        setResetNewPassword('');
+        setResetConfirmPassword('');
+        
+        setTimeout(() => {
+          navigate('/login');
+        }, 3000);
+
+      } else if (isSignUp) {
+        // Validate user inputs
+        if (!displayName.trim()) {
+          throw new Error('Please enter your display name.');
+        }
+
+        const validation = validateEmailAddress(formattedEmail);
+        if (!validation.isValid) {
+          throw new Error(validation.error || 'Please enter a valid email address.');
+        }
+
+        if (!phone.trim()) {
+          throw new Error('Please enter your phone number.');
+        }
+
+        if (!password || password.length < 6) {
+          throw new Error('Password must be at least 6 characters.');
+        }
+        if (password !== confirmPassword) {
+          throw new Error('Passwords do not match. Please verify that your password confirmation matches.');
+        }
+
+        // Check if user is already registered in Firestore
+        const usersRef = collection(db, 'users');
+        const q = query(usersRef, where('email', '==', formattedEmail));
+        const querySnap = await getDocs(q);
+
+        if (!querySnap.empty) {
+          throw new Error('This email address is already registered. Please sign in instead.');
+        }
+
+        // Clear referral/code parameters from the URL before signing in
+        navigate('/signup', true);
+
+        // Handle Registration in Firebase Auth
+        let user;
+        try {
+          const userCredential = await createUserWithEmailAndPassword(auth, formattedEmail, deriveAuthPassword(formattedEmail));
+          user = userCredential.user;
+        } catch (regErr: any) {
+          if (regErr.code === 'auth/email-already-in-use') {
+            try {
+              const userCredential = await signInWithEmailAndPassword(auth, formattedEmail, deriveAuthPassword(formattedEmail));
+              user = userCredential.user;
+            } catch (loginErr: any) {
+              let version = 1;
+              let versionedEmail = '';
+              let success = false;
+              while (!success && version < 20) {
+                const parts = formattedEmail.split('@');
+                versionedEmail = `${parts[0]}+v${version}@${parts[1]}`;
+                try {
+                  const userCredential = await createUserWithEmailAndPassword(auth, versionedEmail, deriveAuthPassword(formattedEmail));
+                  user = userCredential.user;
+                  success = true;
+                } catch (vErr: any) {
+                  if (vErr.code === 'auth/email-already-in-use') {
+                    try {
+                      const userCredential = await signInWithEmailAndPassword(auth, versionedEmail, deriveAuthPassword(formattedEmail));
+                      user = userCredential.user;
+                      success = true;
+                    } catch (vLoginErr) {
+                      version++;
+                    }
+                  } else {
+                    throw vErr;
+                  }
+                }
+              }
+              if (!success) {
+                throw new Error('Could not recreate user account. Please try a different email address.');
+              }
+            }
+          } else {
+            throw regErr;
+          }
+        }
+
+        // Generate dynamic unique referral code for the new user
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        let generatedCode = '';
+        for (let i = 0; i < 5; i++) {
+          generatedCode += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+
+        const trimmedReferral = referral.trim().toUpperCase();
+        const selectedCountryObj = COUNTRIES.find(c => c.code === country) || COUNTRIES[0];
+        const rawPhone = phone.trim().replace(/^0+/, '');
+        const formattedPhone = rawPhone.startsWith('+') ? rawPhone : `${selectedCountryObj.dialCode} ${rawPhone}`;
+
+        // Initialize user document in Firestore directly without email verification
+        const docRef = doc(db, 'users', user.uid);
+        await setDoc(docRef, {
+          uid: user.uid,
+          email: formattedEmail,
+          displayName: displayName.trim() || formattedEmail.split('@')[0],
+          phone: formattedPhone,
+          country: country,
+          balance: 0.0,
+          usdtBalance: 0.0,
+          referralSource: trimmedReferral,
+          uniqueCode: generatedCode,
+          createdAt: serverTimestamp(),
+          withdrawalEnabled: true,
+          tradeEnabled: true,
+          walletPassword: '',
+          accountPassword: password,
+          authEmail: user.email,
+          emailVerified: true
+        });
+
+        // Save referral code mapping
+        try {
+          await setDoc(doc(db, 'referralCodes', generatedCode), {
+            uid: user.uid,
+            email: formattedEmail
+          });
+        } catch (mappingErr) {
+          console.error('Error saving referral code mapping:', mappingErr);
+        }
+
+        // Save session details to localStorage
+        localStorage.setItem('custom_user_email', formattedEmail);
+        localStorage.setItem('custom_user_uid', user.uid);
+
+        // Auto-credit referrer if referral code was used
+        if (trimmedReferral) {
+          try {
+            const refMappingSnap = await getDoc(doc(db, 'referralCodes', trimmedReferral));
+            if (refMappingSnap.exists()) {
+              const refData = refMappingSnap.data();
+              const referrerUid = refData.uid;
+              const referrerEmail = refData.email || '';
+
+              const referralsQuery = query(collection(db, 'users'), where('referralSource', '==', trimmedReferral));
+              const referralsSnap = await getDocs(referralsQuery);
+              const referralsCount = referralsSnap.size;
+
+              let rewardAmount = 0.10;
+              let tierName = 'Starter';
+              if (referralsCount >= 40) {
+                rewardAmount = 0.40;
+                tierName = 'Gold';
+              } else if (referralsCount >= 20) {
+                rewardAmount = 0.30;
+                tierName = 'Silver';
+              } else if (referralsCount >= 7) {
+                rewardAmount = 0.20;
+                tierName = 'Bronze';
+              }
+
+              await updateDoc(doc(db, 'users', referrerUid), {
+                balance: increment(rewardAmount),
+                usdtBalance: increment(rewardAmount)
+              });
+
+              await addDoc(collection(db, 'transactions'), {
+                userId: referrerUid,
+                userEmail: referrerEmail,
+                type: 'referral_reward',
+                amount: rewardAmount,
+                status: 'APPROVED',
+                createdAt: serverTimestamp(),
+                paymentMessage: `Referral bonus (${tierName} Tier): successfully invited ${formattedEmail}`
+              });
+            }
+          } catch (refErr) {
+            console.error('Error auto-crediting referral reward:', refErr);
+          }
+        }
+
+        // Prompt browser / PWA password manager to save credentials under current origin
+        if (typeof window !== 'undefined' && 'PasswordCredential' in window && navigator.credentials?.store) {
+          try {
+            const cred = new (window as any).PasswordCredential({
+              id: formattedEmail,
+              password: password,
+              name: displayName || formattedEmail.split('@')[0],
+            });
+            await navigator.credentials.store(cred);
+          } catch {
+            // Non-blocking credential store fallback
+          }
+        }
+
+        localStorage.removeItem('pending_referral_code');
+        onSuccess();
+
+      } else {
+        // Handle Sign In
+        const usersRef = collection(db, 'users');
+        const q = query(usersRef, where('email', '==', formattedEmail));
+        const querySnap = await getDocs(q);
+
+        if (querySnap.empty) {
+          throw new Error('No account found with this email address.');
+        }
+
+        const userDoc = querySnap.docs[0];
+        const userData = userDoc.data();
+        const activeUserUid = userDoc.id;
+
+        // Verify password against Firestore accountPassword
+        const firestorePassword = userData.accountPassword;
+        if (!firestorePassword || firestorePassword !== password) {
+          throw new Error('Incorrect password. Please verify your credentials or use the reset password option.');
+        }
+
+        const authEmailToUse = userData.authEmail || userData.email || formattedEmail;
+
+        try {
+          await signInWithEmailAndPassword(auth, authEmailToUse, deriveAuthPassword(formattedEmail));
+        } catch (authSignInErr: any) {
+          try {
+            await signInWithEmailAndPassword(auth, formattedEmail, deriveAuthPassword(formattedEmail));
+          } catch (secondAuthErr: any) {
+            console.log('Firebase Auth internal credential fallback...');
+          }
+        }
+
+        localStorage.setItem('custom_user_email', formattedEmail);
+        localStorage.setItem('custom_user_uid', activeUserUid);
+
+        let has2fa = false;
+        const docRef = doc(db, 'users', activeUserUid);
+        const freshSnap = await getDoc(docRef);
+        if (freshSnap.exists()) {
+          const freshData = freshSnap.data();
+          if (freshData.twoFactorEnabled && freshData.twoFactorSecret) {
+            has2fa = true;
+          }
+        } else {
+          await setDoc(docRef, {
+            uid: activeUserUid,
+            email: formattedEmail,
+            displayName: formattedEmail.split('@')[0],
+            balance: 0.0,
+            usdtBalance: 0.0,
+            referralSource: '',
+            createdAt: serverTimestamp(),
+            withdrawalEnabled: true,
+            tradeEnabled: true,
+            walletPassword: '',
+            twoFactorEnabled: false,
+            accountPassword: password,
+            authEmail: formattedEmail
+          });
+        }
+
+        if (has2fa) {
+          setShow2faPrompt(true);
+        } else {
+          // Prompt browser / PWA password manager to save/update credentials under current origin
+          if (typeof window !== 'undefined' && 'PasswordCredential' in window && navigator.credentials?.store) {
+            try {
+              const cred = new (window as any).PasswordCredential({
+                id: formattedEmail,
+                password: password,
+                name: formattedEmail.split('@')[0],
+              });
+              await navigator.credentials.store(cred);
+            } catch {
+              // Non-blocking credential store fallback
+            }
+          }
+
+          localStorage.removeItem('pending_referral_code');
+          onSuccess();
+        }
+      }
+    } catch (err: any) {
+      console.error('Authentication Error:', err);
+      let cleanMessage = 'Authentication failed. Please verify your details.';
+      if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
+        cleanMessage = 'Invalid email or password.';
+      } else if (err.code === 'auth/email-already-in-use') {
+        cleanMessage = 'This email address is already registered.';
+      } else if (err.code === 'auth/weak-password') {
+        cleanMessage = 'Password must be at least 6 characters.';
+      } else if (err.message) {
+        cleanMessage = err.message;
+      }
+      setError(cleanMessage);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div id="auth-page-container" className="min-h-screen bg-[#131722] text-slate-100 font-sans relative overflow-hidden flex flex-col justify-center items-center py-12">
+      <style>{`
+        @keyframes float-slow {
+          0%, 100% { transform: translateY(0px) rotate(0deg); }
+          50% { transform: translateY(-16px) rotate(4deg); }
+        }
+        .animate-float-slow {
+          animation: float-slow 9s ease-in-out infinite;
+        }
+        @keyframes float-fast {
+          0%, 100% { transform: translateY(0px) rotate(0deg); }
+          50% { transform: translateY(-10px) rotate(-4deg); }
+        }
+        .animate-float-fast {
+          animation: float-fast 6s ease-in-out infinite;
+        }
+        @keyframes drift-up {
+          0% { transform: translateY(0px) scale(0.96); opacity: 0.25; }
+          50% { transform: translateY(-12px) scale(1.02); opacity: 0.45; }
+          100% { transform: translateY(0px) scale(0.96); opacity: 0.25; }
+        }
+        .animate-drift-up {
+          animation: drift-up 7s ease-in-out infinite;
+        }
+        @keyframes shimmer-gold {
+          0%, 100% { opacity: 0.3; }
+          50% { opacity: 0.65; }
+        }
+        .animate-shimmer-gold {
+          animation: shimmer-gold 4s ease-in-out infinite;
+        }
+      `}</style>
+
+      {/* 1. Money-Themed Background System */}
+      <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0">
+        {/* Ambient Wealth & Golden Glows */}
+        <div className="absolute -top-32 left-1/2 -translate-x-1/2 w-[650px] h-[450px] bg-gradient-to-b from-amber-300/25 via-amber-200/15 to-transparent rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute -bottom-36 -left-20 w-[450px] h-[450px] bg-emerald-400/15 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute top-1/3 -right-24 w-[400px] h-[400px] bg-amber-400/15 rounded-full blur-3xl pointer-events-none" />
+
+        {/* Banknote Micro-Security Pattern / Currency Lattice Grid */}
+        <div className="absolute inset-0 bg-[radial-gradient(#d97706_0.7px,transparent_0.7px)] [background-size:24px_24px] opacity-[0.06]" />
+
+        {/* Banknote Guilloche / Security Curve Watermarks */}
+        <svg className="absolute -top-10 -left-10 w-96 h-96 opacity-[0.08] text-emerald-800" viewBox="0 0 200 200" fill="none">
+          <circle cx="100" cy="100" r="80" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+          <circle cx="100" cy="100" r="60" stroke="currentColor" strokeWidth="1.5" />
+          <circle cx="100" cy="100" r="40" stroke="currentColor" strokeWidth="0.75" />
+          <path d="M20,100 Q60,20 100,100 T180,100" stroke="currentColor" strokeWidth="1" />
+          <path d="M20,100 Q60,180 100,100 T180,100" stroke="currentColor" strokeWidth="1" />
+          <path d="M100,20 Q20,60 100,100 T100,180" stroke="currentColor" strokeWidth="1" />
+          <path d="M100,20 Q180,60 100,100 T100,180" stroke="currentColor" strokeWidth="1" />
+        </svg>
+
+        <svg className="absolute -bottom-16 -right-16 w-[28rem] h-[28rem] opacity-[0.07] text-amber-800" viewBox="0 0 200 200" fill="none">
+          <circle cx="100" cy="100" r="90" stroke="currentColor" strokeWidth="1.5" />
+          <circle cx="100" cy="100" r="70" stroke="currentColor" strokeWidth="1" strokeDasharray="4 2" />
+          <circle cx="100" cy="100" r="50" stroke="currentColor" strokeWidth="1.5" />
+          <polygon points="100,15 125,75 190,75 137,115 158,175 100,140 42,175 63,115 10,75 75,75" stroke="currentColor" strokeWidth="0.8" />
+        </svg>
+
+        {/* Floating Banknote Card 1 (Top Left) */}
+        <div className="absolute top-[12%] left-[3%] lg:left-[8%] opacity-35 hidden sm:block animate-float-slow">
+          <div className="w-44 h-24 rounded-2xl bg-gradient-to-br from-emerald-50 to-emerald-100/80 border-2 border-emerald-300/80 p-2.5 shadow-lg shadow-emerald-600/5 rotate-[-8deg] backdrop-blur-xs flex flex-col justify-between">
+            <div className="flex justify-between items-center text-emerald-800">
+              <span className="font-mono font-black text-xs">$100</span>
+              <span className="text-[9px] font-bold tracking-widest uppercase">FEDERAL RESERVE</span>
+              <span className="font-mono font-black text-xs">$100</span>
+            </div>
+            <div className="flex items-center justify-center">
+              <div className="w-9 h-9 rounded-full border border-emerald-400 bg-emerald-200/50 flex items-center justify-center text-emerald-800 font-bold text-sm font-serif">
+                $
+              </div>
+            </div>
+            <div className="flex justify-between items-center text-[8px] font-mono text-emerald-700 font-semibold">
+              <span>SERIES 2026</span>
+              <span>SECURED VAULT</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Floating Banknote Card 2 (Bottom Right) */}
+        <div className="absolute bottom-[14%] right-[3%] lg:right-[8%] opacity-35 hidden sm:block animate-float-fast">
+          <div className="w-44 h-24 rounded-2xl bg-gradient-to-br from-amber-50 to-amber-100/90 border-2 border-amber-300/80 p-2.5 shadow-lg shadow-amber-600/5 rotate-[10deg] backdrop-blur-xs flex flex-col justify-between">
+            <div className="flex justify-between items-center text-amber-900">
+              <span className="font-mono font-black text-xs">1000</span>
+              <span className="text-[9px] font-bold tracking-widest uppercase">GOLD BOND</span>
+              <span className="font-mono font-black text-xs">1000</span>
+            </div>
+            <div className="flex items-center justify-center">
+              <div className="w-9 h-9 rounded-full border border-amber-400 bg-amber-200/60 flex items-center justify-center text-amber-900 font-bold text-xs font-mono">
+                ₮
+              </div>
+            </div>
+            <div className="flex justify-between items-center text-[8px] font-mono text-amber-800 font-semibold">
+              <span>MOREX TREASURY</span>
+              <span>100% BACKED</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Floating Gold Coin Badges */}
+        <div className="absolute top-[28%] left-[2%] lg:left-[5%] animate-float-fast opacity-40">
+          <div className="w-16 h-16 rounded-full bg-gradient-to-br from-amber-200 via-amber-400 to-amber-600 border-2 border-white shadow-md flex items-center justify-center text-amber-950 font-black text-2xl font-serif rotate-[-12deg]">
+            $
+          </div>
+        </div>
+
+        <div className="absolute bottom-[28%] left-[4%] lg:left-[7%] animate-float-slow opacity-35">
+          <div className="w-14 h-14 rounded-full bg-gradient-to-br from-amber-100 via-amber-300 to-amber-500 border-2 border-white shadow-md flex items-center justify-center text-amber-950 font-black text-xl font-mono rotate-[15deg]">
+            ₿
+          </div>
+        </div>
+
+        <div className="absolute top-[16%] right-[4%] lg:right-[7%] animate-float-slow opacity-35">
+          <div className="w-14 h-14 rounded-full bg-gradient-to-br from-emerald-200 via-emerald-400 to-emerald-600 border-2 border-white shadow-md flex items-center justify-center text-emerald-950 font-black text-xl font-sans rotate-[8deg]">
+            €
+          </div>
+        </div>
+
+        <div className="absolute bottom-[24%] right-[2%] lg:right-[6%] animate-float-fast opacity-40">
+          <div className="w-16 h-16 rounded-full bg-gradient-to-br from-amber-200 via-amber-400 to-yellow-500 border-2 border-white shadow-md flex items-center justify-center text-amber-950 font-black text-2xl font-sans rotate-[-10deg]">
+            £
+          </div>
+        </div>
+
+        {/* Floating Financial Candlestick Chart Cluster (Left) */}
+        <div className="absolute top-[48%] left-[3%] lg:left-[6%] opacity-30 hidden md:flex items-end gap-2 animate-drift-up">
+          <div className="flex flex-col items-center">
+            <div className="w-0.5 h-3 bg-emerald-600"></div>
+            <div className="w-3.5 h-8 bg-emerald-500 rounded-xs"></div>
+            <div className="w-0.5 h-2 bg-emerald-600"></div>
+          </div>
+          <div className="flex flex-col items-center">
+            <div className="w-0.5 h-2 bg-emerald-600"></div>
+            <div className="w-3.5 h-12 bg-emerald-500 rounded-xs"></div>
+            <div className="w-0.5 h-4 bg-emerald-600"></div>
+          </div>
+          <div className="flex flex-col items-center">
+            <div className="w-0.5 h-4 bg-emerald-600"></div>
+            <div className="w-3.5 h-16 bg-emerald-400 rounded-xs"></div>
+            <div className="w-0.5 h-3 bg-emerald-600"></div>
+          </div>
+        </div>
+
+        {/* Floating Profit Badges (Right) */}
+        <div className="absolute top-[44%] right-[3%] lg:right-[6%] opacity-40 hidden md:block animate-drift-up">
+          <div className="space-y-2">
+            <div className="px-3 py-1.5 rounded-xl bg-emerald-50/90 border border-emerald-300 text-emerald-700 font-mono text-xs font-black shadow-sm flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              +$1,450.00 ROI
+            </div>
+            <div className="px-3 py-1.5 rounded-xl bg-amber-50/90 border border-amber-300 text-amber-800 font-mono text-xs font-black shadow-sm flex items-center gap-1.5">
+              <span>⚡</span>
+              PROFIT SECURED
+            </div>
+          </div>
+        </div>
+
+        {/* Big Subtle Backdrop Currency Symbols */}
+        <div className="absolute top-[8%] left-[25%] opacity-[0.04] text-amber-600 font-serif font-black text-9xl pointer-events-none">
+          $
+        </div>
+        <div className="absolute bottom-[8%] right-[28%] opacity-[0.04] text-emerald-700 font-mono font-black text-9xl pointer-events-none">
+          ₿
+        </div>
+      </div>
+
+      {/* 2. Centered Auth Container */}
+      <div className="w-full max-w-[420px] px-4 relative z-10 flex flex-col justify-center">
+            
+            {/* Logo/Banner section with MOREX + DRW Collaboration */}
+            <div className="text-center mb-5">
+              {/* Sleek Unified Collaboration Badge with Names Below Logos */}
+              <div className="inline-flex items-center gap-3 sm:gap-4 p-2.5 px-4 bg-white/95 backdrop-blur-md rounded-2xl border border-amber-200/90 shadow-sm mb-4 group hover:border-amber-300 transition-all">
+                {/* MOREX Logo & Label */}
+                <div className="flex flex-col items-center justify-center gap-1">
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-amber-500 to-yellow-400 p-1 flex items-center justify-center shadow-xs shrink-0">
+                    <img 
+                      src="/icon.svg" 
+                      alt="MOREX" 
+                      className="w-full h-full object-contain filter drop-shadow-xs"
+                      referrerPolicy="no-referrer"
+                    />
+                  </div>
+                  <span className="text-[10.5px] font-black text-zinc-900 tracking-wider">
+                    MOREX
+                  </span>
+                </div>
+
+                {/* Collaboration Symbol */}
+                <div className="flex items-center justify-center mb-4">
+                  <span className="text-[11px] font-black text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-md border border-amber-200 font-mono">
+                    ✕
+                  </span>
+                </div>
+
+                {/* DRW Trading Group Logo & Label */}
+                <div className="flex flex-col items-center justify-center gap-1">
+                  <div className="h-10 px-3 rounded-xl bg-[#0a1626] border border-slate-700/60 flex items-center justify-center shrink-0 shadow-2xs">
+                    <img 
+                      src="/drw_logo.svg" 
+                      alt="DRW Trading Group" 
+                      className="h-5.5 w-auto object-contain"
+                      referrerPolicy="no-referrer"
+                    />
+                  </div>
+                  <span className="text-[10px] font-extrabold text-slate-900 tracking-tight whitespace-nowrap">
+                    DRW Trading Group
+                  </span>
+                </div>
+              </div>
+
+              {/* Attractive 'Be Your Own Boss' Headline & Subtitle */}
+              <div className="space-y-1">
+                <h1 className="text-2xl sm:text-[26px] font-black tracking-tight text-white leading-tight">
+                  Be Your Own Boss<span className="text-[#ff444f]">.</span>
+                </h1>
+                <p className="text-xs sm:text-[12.5px] font-medium text-slate-400 max-w-[310px] mx-auto leading-relaxed">
+                  Earn daily passive income with automated expert copy trading & high-frequency arbitrage.
+                </p>
+              </div>
+            </div>
+
+            {/* Main Auth Form Container Card */}
+            <div className="bg-[#181c24] border border-slate-800 rounded-3xl p-5 sm:p-6 shadow-2xl space-y-5 text-white">
+              {show2faPrompt ? (
+                <div className="space-y-6">
+                  <div className="space-y-1">
+                    <h2 className="text-lg font-bold text-zinc-800 flex items-center gap-2">
+                      <Shield size={18} className="text-amber-500" />
+                      Two-Factor Verification
+                    </h2>
+                    <p className="text-xs text-zinc-500 leading-relaxed">
+                      This wallet is secured with Two-Factor Authentication. Please enter the 6-digit passcode from your Google Authenticator app.
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleVerify2faLogin} className="space-y-4">
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-zinc-400 uppercase tracking-wider block text-center">Google Authenticator Code</label>
+                      <input
+                        id="auth-2fa-input"
+                        type="text"
+                        maxLength={6}
+                        required
+                        autoFocus
+                        placeholder="000000"
+                        value={twoFactorCode}
+                        onChange={(e) => setTwoFactorCode(e.target.value.replace(/\D/g, ''))}
+                        className="w-full px-4 py-3 bg-zinc-50 border border-zinc-200 rounded-xl text-center font-mono text-lg tracking-widest text-amber-600 focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500"
+                      />
+                    </div>
+
+                    <button
+                      id="auth-2fa-verify-btn"
+                      type="submit"
+                      className="w-full py-3 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-bold rounded-xl text-xs tracking-wider uppercase shadow-md transition-all cursor-pointer"
+                    >
+                      Verify & Log In
+                    </button>
+
+                    <button
+                      id="auth-2fa-cancel-btn"
+                      type="button"
+                      onClick={() => { setShow2faPrompt(false); setTwoFactorCode(''); setTwoFactorError(null); }}
+                      className="w-full py-2 bg-zinc-100 hover:bg-zinc-200 text-zinc-600 rounded-xl text-[10px] uppercase font-bold tracking-wider transition-all cursor-pointer text-center"
+                    >
+                      Back to Sign In
+                    </button>
+                  </form>
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-1">
+                    <h2 className="text-lg font-bold text-zinc-800">
+                      {isReset ? 'Reset Wallet Password' : isSignUp ? 'Create your Wallet' : 'Sign in to Wallet'}
+                    </h2>
+                    <p className="text-xs text-zinc-400">
+                      {isReset 
+                        ? 'Enter your email and a new password to reset your account password.' 
+                        : isSignUp 
+                          ? 'Sign up and start trading digital assets.' 
+                          : 'Enter your credentials to make profits.'
+                      }
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleSubmit} className="space-y-4">
+                    
+                    {/* Display Name - Sign Up Only */}
+                    {isSignUp && !isReset && (
+                      <div className="space-y-1">
+                        <label htmlFor="auth-display-name" className="text-xs font-semibold text-zinc-600 cursor-pointer">Display Name</label>
+                        <div className="relative">
+                          <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-zinc-400 pointer-events-none z-10">
+                            <User size={15} />
+                          </span>
+                          <input
+                            id="auth-display-name"
+                            name="displayName"
+                            type="text"
+                            required
+                            autoComplete="name"
+                            autoCapitalize="words"
+                            autoCorrect="off"
+                            placeholder="John Doe"
+                            value={displayName}
+                            onChange={(e) => setDisplayName(e.target.value)}
+                            className="w-full pl-9 pr-4 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Country Dropdown - Sign Up Only */}
+                    {isSignUp && !isReset && (
+                      <div className="space-y-1 relative">
+                        <label htmlFor="auth-country-trigger" className="text-xs font-semibold text-zinc-600 cursor-pointer">Country of Residence</label>
+                        
+                        <button
+                          id="auth-country-trigger"
+                          type="button"
+                          onClick={() => setIsCountryOpen(!isCountryOpen)}
+                          className="w-full px-3 py-2.5 bg-zinc-50 hover:bg-zinc-100/90 border border-zinc-200 rounded-xl text-xs flex items-center justify-between transition-all focus:outline-none focus:ring-1 focus:ring-amber-500 text-zinc-800 font-medium cursor-pointer shadow-sm active:scale-[0.99]"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <span className="text-base leading-none shrink-0">{COUNTRIES.find(c => c.code === country)?.flag || '🇰🇪'}</span>
+                            <span className="font-semibold text-zinc-800 truncate">{COUNTRIES.find(c => c.code === country)?.name || country}</span>
+                            <span className="text-[10px] bg-zinc-200/80 text-zinc-700 font-bold font-mono px-1.5 py-0.5 rounded shrink-0">
+                              {COUNTRIES.find(c => c.code === country)?.dialCode || '+254'}
+                            </span>
+                          </div>
+                          <ChevronDown size={15} className={`text-zinc-400 shrink-0 transition-transform duration-200 ${isCountryOpen ? 'rotate-180 text-amber-500' : ''}`} />
+                        </button>
+
+                        {/* Custom Modern Dropdown Menu */}
+                        {isCountryOpen && (
+                          <>
+                            <div 
+                              className="fixed inset-0 z-40" 
+                              onClick={() => setIsCountryOpen(false)} 
+                            />
+                            
+                            <div className="absolute left-0 right-0 top-full mt-1.5 z-50 bg-white border border-amber-200/80 rounded-2xl shadow-xl p-1.5 space-y-1 animate-in fade-in zoom-in-95 duration-150">
+                              {COUNTRIES.map((c) => {
+                                const isSelected = country === c.code;
+                                return (
+                                  <button
+                                    key={c.code}
+                                    id={`auth-country-opt-${c.code.toLowerCase().replace(/\s+/g, '-')}`}
+                                    type="button"
+                                    onClick={() => {
+                                      setCountry(c.code);
+                                      setIsCountryOpen(false);
+                                    }}
+                                    className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs transition-all cursor-pointer ${
+                                      isSelected 
+                                        ? 'bg-amber-500/10 border border-amber-500/30 text-amber-950 font-bold shadow-xs' 
+                                        : 'hover:bg-amber-50/60 text-zinc-700 font-medium border border-transparent'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2.5">
+                                      <span className="text-base leading-none">{c.flag}</span>
+                                      <span>{c.name}</span>
+                                      <span className="text-[10px] font-mono text-zinc-500 font-semibold">
+                                        ({c.dialCode})
+                                      </span>
+                                    </div>
+                                    {isSelected && <Check size={14} className="text-amber-600 shrink-0 stroke-[3]" />}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Email Field */}
+                    <div className="space-y-1">
+                      <label htmlFor="auth-email" className="text-xs font-semibold text-zinc-600 cursor-pointer">Email Address</label>
+                      <div className="relative">
+                        <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-zinc-400 pointer-events-none z-10">
+                          <Mail size={15} />
+                        </span>
+                        <input
+                          id="auth-email"
+                          name="email"
+                          type="email"
+                          required
+                          autoComplete="username email"
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          placeholder="alex@gmail.com or personal"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          className="w-full pl-9 pr-4 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                        />
+                      </div>
+
+                      {/* Live Typo Auto-Suggestion Banner */}
+                      {isSignUp && emailSuggestion && (
+                        <div className="flex items-center justify-between bg-amber-50 border border-amber-200/80 rounded-lg px-2.5 py-1 text-[11px] text-amber-900 mt-1">
+                          <span>
+                            Did you mean <strong className="font-semibold">{emailSuggestion}</strong>?
+                          </span>
+                          <button
+                            id="auth-apply-email-suggestion"
+                            type="button"
+                            onClick={() => setEmail(emailSuggestion)}
+                            className="text-amber-700 font-bold hover:underline ml-2 cursor-pointer shrink-0"
+                          >
+                            Fix
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Phone Number - Sign Up Only */}
+                    {isSignUp && !isReset && (
+                      <div className="space-y-1">
+                        <label htmlFor="auth-phone" className="text-xs font-semibold text-zinc-600 cursor-pointer">Phone Number</label>
+                        <div className="relative flex items-center">
+                          <div className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none z-10 gap-1.5">
+                            <span className="text-sm leading-none">{COUNTRIES.find(c => c.code === country)?.flag || '🇰🇪'}</span>
+                            <span className="text-xs font-bold text-zinc-600 font-mono">{COUNTRIES.find(c => c.code === country)?.dialCode || '+254'}</span>
+                            <span className="h-4 w-[1px] bg-zinc-200 ml-0.5" />
+                          </div>
+                          <input
+                            id="auth-phone"
+                            name="phone"
+                            type="tel"
+                            required
+                            autoComplete="tel"
+                            placeholder="700 000 000"
+                            value={phone}
+                            onChange={(e) => setPhone(e.target.value)}
+                            className="w-full pl-24 pr-4 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800 font-medium"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Custom Reset Fields (New Password, Confirm Password) - Reset Only */}
+                    {isReset && (
+                      <>
+                        {/* New Password */}
+                        <div className="space-y-1">
+                          <label htmlFor="auth-reset-new-password" className="text-xs font-semibold text-zinc-600 cursor-pointer">New Password</label>
+                          <div className="relative">
+                            <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-zinc-400 pointer-events-none z-10">
+                              <Lock size={15} />
+                            </span>
+                            <input
+                              id="auth-reset-new-password"
+                              name="newPassword"
+                              type={showResetPassword ? 'text' : 'password'}
+                              required
+                              minLength={6}
+                              autoComplete="new-password"
+                              placeholder="••••••••"
+                              value={resetNewPassword}
+                              onChange={(e) => setResetNewPassword(e.target.value)}
+                              className="w-full pl-9 pr-10 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowResetPassword(!showResetPassword)}
+                              className="absolute inset-y-0 right-0 flex items-center pr-3 text-zinc-400 hover:text-zinc-600 focus:outline-none cursor-pointer z-10"
+                              title={showResetPassword ? "Hide password" : "Show password"}
+                            >
+                              {showResetPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Confirm New Password */}
+                        <div className="space-y-1">
+                          <label htmlFor="auth-reset-confirm-password" className="text-xs font-semibold text-zinc-600 cursor-pointer">Confirm New Password</label>
+                          <div className="relative">
+                            <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-zinc-400 pointer-events-none z-10">
+                              <Lock size={15} />
+                            </span>
+                            <input
+                              id="auth-reset-confirm-password"
+                              name="confirmPassword"
+                              type={showResetPassword ? 'text' : 'password'}
+                              required
+                              minLength={6}
+                              autoComplete="new-password"
+                              placeholder="••••••••"
+                              value={resetConfirmPassword}
+                              onChange={(e) => setResetConfirmPassword(e.target.value)}
+                              className="w-full pl-9 pr-10 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                            />
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Password Field - Login / Sign Up Only */}
+                    {!isReset && (
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-center">
+                          <label htmlFor="auth-password" className="text-xs font-semibold text-zinc-600 cursor-pointer">Password</label>
+                          {!isSignUp && (
+                            <button
+                              id="auth-forgot-password"
+                              type="button"
+                              onClick={() => { navigate('/reset'); setError(null); }}
+                              className="text-[11px] font-medium text-amber-600 hover:text-amber-700 hover:underline cursor-pointer"
+                            >
+                              Forgot?
+                            </button>
+                          )}
+                        </div>
+                        <div className="relative">
+                          <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-zinc-400 pointer-events-none z-10">
+                            <Lock size={15} />
+                          </span>
+                          <input
+                            id="auth-password"
+                            name="password"
+                            type={showPassword ? 'text' : 'password'}
+                            required
+                            minLength={6}
+                            autoComplete={isSignUp ? "new-password" : "current-password"}
+                            placeholder="••••••••"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            className="w-full pl-9 pr-10 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowPassword(!showPassword)}
+                            className="absolute inset-y-0 right-0 flex items-center pr-3 text-zinc-400 hover:text-zinc-600 focus:outline-none cursor-pointer z-10"
+                            title={showPassword ? "Hide password" : "Show password"}
+                          >
+                            {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Confirm Password Field - Sign Up Only */}
+                    {isSignUp && !isReset && (
+                      <div className="space-y-1">
+                        <label htmlFor="auth-confirm-password" className="text-xs font-semibold text-zinc-600 cursor-pointer">Confirm Password</label>
+                        <div className="relative">
+                          <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-zinc-400 pointer-events-none z-10">
+                            <Lock size={15} />
+                          </span>
+                          <input
+                            id="auth-confirm-password"
+                            name="confirmPassword"
+                            type={showConfirmPassword ? 'text' : 'password'}
+                            required
+                            minLength={6}
+                            autoComplete="new-password"
+                            placeholder="••••••••"
+                            value={confirmPassword}
+                            onChange={(e) => setConfirmPassword(e.target.value)}
+                            className="w-full pl-9 pr-10 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                            className="absolute inset-y-0 right-0 flex items-center pr-3 text-zinc-400 hover:text-zinc-600 focus:outline-none cursor-pointer z-10"
+                            title={showConfirmPassword ? "Hide password" : "Show password"}
+                          >
+                            {showConfirmPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Referral Code - Sign Up Only */}
+                    {isSignUp && !isReset && (
+                      <div className="space-y-1">
+                        <label htmlFor="auth-referral" className="text-xs font-semibold text-zinc-600 cursor-pointer">Referral Code (Optional)</label>
+                        <input
+                          id="auth-referral"
+                          name="referral"
+                          type="text"
+                          autoComplete="off"
+                          autoCapitalize="characters"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          placeholder="e.g. FRIEND50"
+                          value={referral}
+                          onChange={(e) => setReferral(e.target.value)}
+                          className="w-full px-3 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 placeholder-zinc-400 text-zinc-800"
+                        />
+                      </div>
+                    )}
+
+                    {/* Submit Button */}
+                    <button
+                      id="auth-submit-btn"
+                      type="submit"
+                      disabled={loading}
+                      className="w-full flex items-center justify-center gap-2 py-3.5 bg-[#ff444f] hover:bg-[#ea3943] text-white rounded-xl text-xs font-bold transition-all mt-4 disabled:bg-slate-800 disabled:text-slate-500 shadow-lg shadow-[#ff444f]/25 cursor-pointer uppercase tracking-wider active:scale-[0.99]"
+                    >
+                      {loading ? (
+                        <>
+                          <RefreshCw size={14} className="animate-spin" />
+                          <span>Please wait...</span>
+                        </>
+                      ) : (
+                        <span>
+                          {isReset 
+                            ? 'Update Password' 
+                            : isSignUp 
+                              ? 'Create Account' 
+                              : 'Log In'
+                          }
+                        </span>
+                      )}
+                    </button>
+
+                  </form>
+
+                  {/* Toggle Button */}
+                  <div className="text-center pt-1">
+                    {isReset ? (
+                      <button
+                        id="auth-back-to-login"
+                        onClick={() => { navigate('/login'); setError(null); }}
+                        className="text-xs font-semibold text-zinc-500 hover:text-zinc-800 hover:underline cursor-pointer"
+                      >
+                        Back to Sign In
+                      </button>
+                    ) : (
+                      <p className="text-xs text-zinc-550">
+                        {isSignUp ? 'Already have an account?' : "Don't have an account?"}{' '}
+                        <button
+                          id="auth-toggle-btn"
+                          onClick={() => { navigate(isSignUp ? '/login' : '/signup'); setError(null); }}
+                          className="text-xs font-bold text-amber-600 hover:text-amber-700 hover:underline cursor-pointer"
+                        >
+                          {isSignUp ? 'Sign In' : 'Sign Up'}
+                        </button>
+                      </p>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+      </div>
+
+      {/* Draggable Floating Support Icon for Auth Pages */}
+      <motion.div
+        id="draggable-auth-floating-support"
+        drag
+        dragMomentum={false}
+        dragElastic={0.12}
+        whileHover={{ scale: 1.08 }}
+        whileTap={{ scale: 0.92 }}
+        onDragStart={() => {
+          dragStartTimeRef.current = Date.now();
+          setIsDraggingSupport(true);
+        }}
+        onDragEnd={() => {
+          setTimeout(() => {
+            setIsDraggingSupport(false);
+          }, 200);
+        }}
+        className="fixed bottom-6 right-5 z-50 touch-none select-none cursor-grab active:cursor-grabbing"
+      >
+        <a
+          id="auth-floating-support-btn"
+          href="https://t.me/Morexsuppor"
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => {
+            if (isDraggingSupport || (dragStartTimeRef.current > 0 && Date.now() - dragStartTimeRef.current < 250)) {
+              e.preventDefault();
+            }
+          }}
+          className="relative flex items-center justify-center w-13 h-13 rounded-full bg-gradient-to-tr from-amber-500 via-amber-400 to-amber-300 text-zinc-950 shadow-xl shadow-amber-500/40 border-2 border-white focus:outline-none group active:shadow-inner"
+          title="24/7 Support (@Morexsuppor)"
+          aria-label="Open 24/7 Customer Support"
+        >
+          {/* Live Online Status Dot */}
+          <span className="absolute top-0 right-0 flex h-3.5 w-3.5 -mt-0.5 -mr-0.5 pointer-events-none">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-emerald-500 border-2 border-white"></span>
+          </span>
+
+          {/* Support Headset Icon */}
+          <Headphones size={22} className="text-zinc-950 group-hover:scale-110 transition-transform" />
+
+          {/* Tooltip on Desktop Hover */}
+          <div className="absolute right-full mr-2.5 top-1/2 -translate-y-1/2 px-2.5 py-1 bg-zinc-900/90 backdrop-blur-sm text-white text-[11px] font-bold rounded-lg whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-md hidden sm:flex items-center gap-1.5 border border-zinc-800">
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+            <span>Customer Support</span>
+          </div>
+        </a>
+      </motion.div>
+    </div>
+  );
+}
